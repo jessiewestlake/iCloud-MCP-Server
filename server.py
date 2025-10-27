@@ -491,14 +491,19 @@ def get_message(
         status, _ = imap.select(mailbox, readonly=True)
         if status != 'OK':
             return {}
-        status, data = imap.uid('FETCH', uid, '(RFC822 FLAGS)')
+        status, data = imap.uid('FETCH', uid, '(BODY.PEEK[] FLAGS)')
         if status != 'OK' or not data:
             return {}
         for part in data:
             if isinstance(part, tuple):
-                raw_msg = part[1]
-            if isinstance(part[0], bytes):
-                flags.extend(_parse_message_flags(part[0]))
+                header_bytes = part[0] if isinstance(part[0], bytes) else None
+                payload_bytes = part[1] if isinstance(part[1], (bytes, bytearray)) else None
+                if payload_bytes:
+                    raw_msg = bytes(payload_bytes)
+                if header_bytes:
+                    flags.extend(_parse_message_flags(header_bytes))
+            elif isinstance(part, bytes):
+                flags.extend(_parse_message_flags(part))
     finally:
         try:
             imap.close()
@@ -541,23 +546,35 @@ def get_message(
         disp = part.get_content_disposition() or ''
         filename = part.get_filename()
         payload = part.get_payload(decode=True)
+        payload_bytes = payload if isinstance(payload, (bytes, bytearray)) else None
         if part.get_content_maintype() == 'multipart':
             continue
         if filename or disp.strip().lower().startswith('attachment'):
+            payload_size = len(payload_bytes) if payload_bytes else 0
             attachments.append({
                 "attachment_id": str(att_index),
                 "filename": _decode_header(filename) if filename else f"attachment-{att_index}",
                 "content_type": content_type,
-                "size": len(payload) if payload else 0,
+                "size": payload_size,
             })
             att_index += 1
         else:
             # Body part
-            try:
-                charset = part.get_content_charset() or 'utf-8'
-                text = payload.decode(charset, errors='replace') if payload else ''
-            except Exception:
-                text = payload.decode('utf-8', errors='replace') if payload else ''
+            charset = part.get_content_charset() or 'utf-8'
+            text: str = ''
+            data = payload_bytes
+            if data is None:
+                # Some 7bit/8bit sections return str unless explicitly decoded.
+                raw_payload = part.get_payload(decode=False)
+                if isinstance(raw_payload, str):
+                    text = raw_payload
+                elif isinstance(raw_payload, bytes):
+                    data = raw_payload
+            if data is not None and not text:
+                try:
+                    text = data.decode(charset, errors='replace')
+                except Exception:
+                    text = data.decode('utf-8', errors='replace')
             if content_type == 'text/plain':
                 text_body += text
             elif content_type == 'text/html':
@@ -609,12 +626,14 @@ def download_attachment(
         status, _ = imap.select(mailbox, readonly=True)
         if status != 'OK':
             return {}
-        status, data = imap.uid('FETCH', uid, '(RFC822)')
+        status, data = imap.uid('FETCH', uid, '(BODY.PEEK[])')
         if status != 'OK' or not data:
             return {}
         for part in data:
             if isinstance(part, tuple):
-                raw_msg = part[1]
+                payload = part[1]
+                if isinstance(payload, (bytes, bytearray)):
+                    raw_msg = bytes(payload)
                 break
     finally:
         try:
@@ -636,16 +655,25 @@ def download_attachment(
             continue
         if filename or disp.strip().lower().startswith('attachment'):
             if str(idx) == attachment_id:
-                payload = part.get_payload(decode=True) or b''
-                try:
-                    encoded = base64.b64encode(payload).decode('ascii')
-                except Exception:
-                    encoded = base64.b64encode(payload).decode('ascii')
+                payload_raw = part.get_payload(decode=True)
+                if isinstance(payload_raw, bytes):
+                    payload_bytes = payload_raw
+                elif isinstance(payload_raw, bytearray):
+                    payload_bytes = bytes(payload_raw)
+                else:
+                    fallback = part.get_payload(decode=False)
+                    if isinstance(fallback, bytes):
+                        payload_bytes = fallback
+                    elif isinstance(fallback, str):
+                        payload_bytes = fallback.encode('utf-8', errors='replace')
+                    else:
+                        payload_bytes = b''
+                encoded = base64.b64encode(payload_bytes).decode('ascii')
                 return {
                     "filename": _decode_header(filename) if filename else f"attachment-{attachment_id}",
                     "content_type": part.get_content_type(),
                     "data": encoded,
-                    "size": len(payload),
+                    "size": len(payload_bytes),
                 }
             idx += 1
     return {}
@@ -768,23 +796,7 @@ def create_draft(
             pass
     return msg.get('Message-ID', '') or ''
 
-
-@mcp.tool()
-def move_message(
-    mailbox: str,
-    uid: str,
-    dest_mailbox: str
-) -> bool:
-    """
-    Move a message from one mailbox to another.
-
-    Args:
-        mailbox: Source mailbox containing the message.
-        uid: UID of the message to move.
-        dest_mailbox: Destination mailbox name.
-
-    Returns: True if the message was successfully moved, False otherwise.
-    """
+def _move_message_impl(mailbox: str, uid: str, dest_mailbox: str) -> bool:
     imap = _open_imap()
     try:
         status, _ = imap.select(mailbox)
@@ -808,6 +820,25 @@ def move_message(
             imap.logout()
         except Exception:
             pass
+
+
+@mcp.tool()
+def move_message(
+    mailbox: str,
+    uid: str,
+    dest_mailbox: str
+) -> bool:
+    """
+    Move a message from one mailbox to another.
+
+    Args:
+        mailbox: Source mailbox containing the message.
+        uid: UID of the message to move.
+        dest_mailbox: Destination mailbox name.
+
+    Returns: True if the message was successfully moved, False otherwise.
+    """
+    return _move_message_impl(mailbox, uid, dest_mailbox)
 
 
 @mcp.tool()
@@ -852,7 +883,7 @@ def archive_message(
     This simply calls `move_message` with the destination set to
     ``ARCHIVE_MAILBOX``.  Returns True on success.
     """
-    return move_message(mailbox, uid, ARCHIVE_MAILBOX)
+    return _move_message_impl(mailbox, uid, ARCHIVE_MAILBOX)
 
 
 @mcp.tool()
