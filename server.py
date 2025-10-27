@@ -75,6 +75,7 @@ import os
 import re
 import smtplib
 import time
+from html.parser import HTMLParser
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
@@ -83,6 +84,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -262,6 +265,46 @@ def _parse_message_flags(resp: bytes) -> List[str]:
         return flags
     except Exception:
         return []
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Simple HTML to plain text converter for fallback bodies."""
+
+    _BREAK_TAGS = {"br", "p", "div", "section", "article", "li", "tr", "hr", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._chunks: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:  # type: ignore[override]
+        if tag in {"br", "hr"}:
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        if tag in self._BREAK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if data:
+            self._chunks.append(data)
+
+    def get_text(self) -> str:
+        raw = "".join(self._chunks)
+        # Normalize whitespace while preserving intentional breaks
+        normalized = re.sub(r"\r\n?", "\n", raw)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        return normalized.strip()
+
+
+def _html_to_text(value: str) -> str:
+    parser = _HTMLTextExtractor()
+    parser.feed(value)
+    parser.close()
+    return parser.get_text()
+
+
+def _empty_tool_result() -> ToolResult:
+    return ToolResult(content=[TextContent(type="text", text="")], structured_content={})
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +497,7 @@ def search_messages(
 def get_message(
     mailbox: str,
     uid: str
-) -> Dict[str, Any]:
+) -> ToolResult:
     """
     Fetch a complete message by UID from the specified mailbox.
 
@@ -490,10 +533,10 @@ def get_message(
     try:
         status, _ = imap.select(mailbox, readonly=True)
         if status != 'OK':
-            return {}
+            return _empty_tool_result()
         status, data = imap.uid('FETCH', uid, '(BODY.PEEK[] FLAGS)')
         if status != 'OK' or not data:
-            return {}
+            return _empty_tool_result()
         for part in data:
             if isinstance(part, tuple):
                 header_bytes = part[0] if isinstance(part[0], bytes) else None
@@ -514,7 +557,7 @@ def get_message(
         except Exception:
             pass
     if not raw_msg:
-        return {}
+        return _empty_tool_result()
     msg = email.message_from_bytes(raw_msg)
     subject = _decode_header(msg.get('Subject'))
     sender = _decode_header(msg.get('From'))
@@ -579,7 +622,12 @@ def get_message(
                 text_body += text
             elif content_type == 'text/html':
                 html_body += text
-    return {
+    if not text_body and html_body:
+        text_body = _html_to_text(html_body)
+
+    body_text_clean = text_body.strip() if text_body else ""
+
+    result = {
         "uid": uid,
         "subject": subject,
         "from": sender,
@@ -596,6 +644,11 @@ def get_message(
         "attachments": attachments,
         "flags": flags,
     }
+
+    return ToolResult(
+        content=[TextContent(type="text", text=body_text_clean or "")],
+        structured_content=result,
+    )
 
 
 @mcp.tool()
