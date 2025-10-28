@@ -9,6 +9,7 @@ This document captures the practical steps that keep the helper tools, server, a
 - **Diagnostics toolbox** (repo root):
   - `devtools/check_message.py` → fetches the newest message and prints both structured and raw content.
   - `devtools/peek_imap.py` → prompts for a UID and fetches raw IMAP payload slices via the `_peek_imap` tool.
+- **OAuth setup**: populate `OAUTH_CONSENT_PASSWORD` in `.env` before starting the server. When ChatGPT performs dynamic client registration it will redirect you to `http://127.0.0.1:8800/oauth/consent?...` to approve the client; registrations persist in `oauth_clients.json`.
 - **Compile-time sanity check**: `python -m compileall server.py` guards against syntax slips before running the server.
 - **Shutdown and cleanup**: take note of the PID (printed by PowerShell/terminal on error) or follow the environment-specific guidance below to stop lingering processes.
 

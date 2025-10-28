@@ -84,10 +84,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.auth.auth import ClientRegistrationOptions
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
+
+from oauth import LocalOAuthProvider
 
 try:
     # CalDAV support for calendar functions.  If this import fails you
@@ -164,6 +167,111 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("icloud-mcp")
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    """Parse an environment variable into a boolean flag."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _split_scopes(raw: Optional[str], fallback: Optional[List[str]] = None) -> List[str]:
+    """Split a scope string (space or comma separated) into a unique list."""
+    result: List[str] = []
+    if raw:
+        for token in raw.replace(",", " ").split():
+            token = token.strip()
+            if token and token not in result:
+                result.append(token)
+    if result:
+        return result
+    return list(fallback or [])
+
+
+def _positive_int(name: str, default: int, minimum: int) -> int:
+    """Read a positive integer environment variable with lower bound enforcement."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("Invalid integer for %s=%s; using default %d", name, raw, default)
+        return default
+    if value < minimum:
+        log.warning("%s must be >= %d; using default %d", name, minimum, default)
+        return default
+    return value
+
+
+def _optional_positive_int(name: str, default: Optional[int]) -> Optional[int]:
+    """Read an optional positive integer; <=0 disables the value."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("Invalid integer for %s=%s; using default %s", name, raw, default)
+        return default
+    if value <= 0:
+        return None
+    return value
+
+
+OAUTH_PROVIDER: Optional[LocalOAuthProvider] = None
+if _env_bool("OAUTH_ENABLED", True):
+    oauth_consent_password = _require_env("OAUTH_CONSENT_PASSWORD")
+    raw_store = os.environ.get("OAUTH_CLIENT_STORE", "").strip()
+    if raw_store:
+        store_path = Path(raw_store).expanduser()
+        if not store_path.is_absolute():
+            store_path = Path(__file__).parent / store_path
+    else:
+        store_path = Path(__file__).with_name("oauth_clients.json")
+
+    raw_base_url = os.environ.get("OAUTH_BASE_URL", "").strip()
+    if not raw_base_url:
+        public_host = SERVER_HOST if SERVER_HOST not in {"0.0.0.0", "::"} else "127.0.0.1"
+        raw_base_url = f"http://{public_host}:{SERVER_PORT}"
+
+    issuer_url = os.environ.get("OAUTH_ISSUER_URL", raw_base_url).strip()
+    service_doc_url = os.environ.get("OAUTH_SERVICE_DOCUMENTATION_URL", "").strip() or None
+
+    default_scopes = _split_scopes(os.environ.get("OAUTH_DEFAULT_SCOPES"), ["icloud.full"])
+    valid_scopes = _split_scopes(os.environ.get("OAUTH_VALID_SCOPES"), default_scopes)
+    required_scopes = _split_scopes(os.environ.get("OAUTH_REQUIRED_SCOPES"), default_scopes)
+
+    pending_ttl = _positive_int("OAUTH_PENDING_TTL", 600, 60)
+    auth_code_ttl = _positive_int("OAUTH_AUTH_CODE_TTL", 600, 60)
+    access_token_ttl = _positive_int("OAUTH_ACCESS_TOKEN_TTL", 3600, 300)
+    refresh_token_ttl = _optional_positive_int("OAUTH_REFRESH_TOKEN_TTL", 7 * 24 * 3600)
+
+    OAUTH_PROVIDER = LocalOAuthProvider(
+        base_url=raw_base_url,
+        issuer_url=issuer_url,
+        service_documentation_url=service_doc_url,
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=valid_scopes,
+            default_scopes=default_scopes,
+        ),
+        consent_password=oauth_consent_password,
+        client_store_path=store_path,
+        required_scopes=required_scopes,
+        pending_ttl_seconds=pending_ttl,
+        auth_code_ttl_seconds=auth_code_ttl,
+        access_token_ttl_seconds=access_token_ttl,
+        refresh_token_ttl_seconds=refresh_token_ttl,
+    )
+    log.info("OAuth authorization enabled (issuer=%s)", issuer_url)
+else:
+    log.warning("OAuth authorization disabled; MCP server is running without authentication.")
+
+
 # ---------------------------------------------------------------------------
 #  MCP Server
 #
@@ -178,7 +286,7 @@ mcp = FastMCP("icloud-mail-calendar", instructions=(
     "supplied in ISO 8601 format (YYYY-MM-DDTHH:MM:SS, optionally with "
     "timezone offsets).  For calendar operations, recurring events are "
     "automatically expanded when requested."
-))
+), auth=OAUTH_PROVIDER)
 
 
 @mcp.custom_route("/health", methods=["GET"])
