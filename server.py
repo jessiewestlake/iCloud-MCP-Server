@@ -70,6 +70,7 @@ import base64
 import datetime as dt
 import email
 import imaplib
+import json
 import logging
 import os
 import re
@@ -304,14 +305,16 @@ def _html_to_text(value: str) -> str:
 
 
 def _empty_tool_result() -> ToolResult:
-    return ToolResult(content=[TextContent(type="text", text="")], structured_content={})
+    return _tool_result({})
 
 
 def _tool_result(payload: Dict[str, Any], *, text: Optional[str] = None) -> ToolResult:
-    """Create a ToolResult with optional human-readable text."""
-    if text is not None:
-        return ToolResult(content=[TextContent(type="text", text=text)], structured_content=payload)
-    return ToolResult(structured_content=payload)
+    """Create a ToolResult that keeps both summary text and JSON detail."""
+    blocks: List[TextContent] = []
+    if text:
+        blocks.append(TextContent(type="text", text=text))
+    blocks.append(TextContent(type="text", text=json.dumps(payload, indent=2, sort_keys=True, default=str)))
+    return ToolResult(content=blocks, structured_content=payload)
 
 
 # ---------------------------------------------------------------------------
