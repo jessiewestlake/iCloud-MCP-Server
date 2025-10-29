@@ -307,6 +307,13 @@ def _empty_tool_result() -> ToolResult:
     return ToolResult(content=[TextContent(type="text", text="")], structured_content={})
 
 
+def _tool_result(payload: Dict[str, Any], *, text: Optional[str] = None) -> ToolResult:
+    """Create a ToolResult with optional human-readable text."""
+    if text is not None:
+        return ToolResult(content=[TextContent(type="text", text=text)], structured_content=payload)
+    return ToolResult(structured_content=payload)
+
+
 # ---------------------------------------------------------------------------
 #  Mail Tools
 #
@@ -318,7 +325,7 @@ def _empty_tool_result() -> ToolResult:
 
 
 @mcp.tool()
-def list_mailboxes() -> List[Dict[str, Any]]:
+def list_mailboxes() -> ToolResult:
     """
     List all available mailboxes in the authenticated user's account.
 
@@ -337,7 +344,7 @@ def list_mailboxes() -> List[Dict[str, Any]]:
                 entry = _parse_imap_list_line(line)
                 if entry:
                     mailboxes.append(entry)
-        return mailboxes
+        return _tool_result({"mailboxes": mailboxes}, text=f"{len(mailboxes)} mailbox(es)")
     finally:
         try:
             imap.logout()
@@ -350,7 +357,7 @@ def list_messages(
     mailbox: str,
     limit: int = 50,
     offset: int = 0
-) -> List[Dict[str, Any]]:
+) -> ToolResult:
     """
     List messages within a mailbox, returning basic metadata for each.
 
@@ -377,10 +384,10 @@ def list_messages(
         # Select mailbox in read-only mode to avoid marking unseen messages
         status, _ = imap.select(mailbox, readonly=True)
         if status != 'OK':
-            return []
+            return _tool_result({"messages": []}, text="0 message(s)")
         status, data = imap.uid('SEARCH', None, 'ALL')
         if status != 'OK' or not data or not data[0]:
-            return []
+            return _tool_result({"messages": []}, text="0 message(s)")
         # data[0] is a space-delimited bytes string of UIDs
         uids = [int(u) for u in data[0].split()]
         uids.sort(reverse=True)
@@ -438,7 +445,7 @@ def list_messages(
                 "flags": flags,
                 "size": size,
             })
-        return messages
+        return _tool_result({"messages": messages}, text=f"{len(messages)} message(s)")
     finally:
         try:
             imap.close()
@@ -454,7 +461,7 @@ def list_messages(
 def search_messages(
     mailbox: str,
     query: str
-) -> List[str]:
+) -> ToolResult:
     """
     Search for messages in a mailbox containing a given text fragment.
 
@@ -473,15 +480,15 @@ def search_messages(
     try:
         status, _ = imap.select(mailbox, readonly=True)
         if status != 'OK':
-            return []
+            return _tool_result({"uids": []}, text="0 matches")
         # IMAP SEARCH expects the search terms as separate arguments.  We
         # wrap the query in quotes so that spaces are included in the
         # search term.
         status, data = imap.uid('SEARCH', None, 'TEXT', f'"{query}"')
         if status != 'OK' or not data or not data[0]:
-            return []
+            return _tool_result({"uids": []}, text="0 matches")
         uids = [uid.decode() if isinstance(uid, bytes) else str(uid) for uid in data[0].split()]
-        return uids
+        return _tool_result({"uids": uids}, text=f"{len(uids)} match(es)")
     finally:
         try:
             imap.close()
@@ -656,7 +663,7 @@ def download_attachment(
     mailbox: str,
     uid: str,
     attachment_id: str
-) -> Dict[str, Any]:
+) -> ToolResult:
     """
     Download a specific attachment from a message.
 
@@ -678,10 +685,10 @@ def download_attachment(
     try:
         status, _ = imap.select(mailbox, readonly=True)
         if status != 'OK':
-            return {}
+            return _tool_result({"attachment": None, "found": False})
         status, data = imap.uid('FETCH', uid, '(BODY.PEEK[])')
         if status != 'OK' or not data:
-            return {}
+            return _tool_result({"attachment": None, "found": False})
         for part in data:
             if isinstance(part, tuple):
                 payload = part[1]
@@ -698,7 +705,7 @@ def download_attachment(
         except Exception:
             pass
     if not raw_msg:
-        return {}
+        return _tool_result({"attachment": None, "found": False})
     msg = email.message_from_bytes(raw_msg)
     idx = 0
     for part in msg.walk():
@@ -722,14 +729,17 @@ def download_attachment(
                     else:
                         payload_bytes = b''
                 encoded = base64.b64encode(payload_bytes).decode('ascii')
-                return {
-                    "filename": _decode_header(filename) if filename else f"attachment-{attachment_id}",
-                    "content_type": part.get_content_type(),
-                    "data": encoded,
-                    "size": len(payload_bytes),
-                }
+                return _tool_result({
+                    "attachment": {
+                        "filename": _decode_header(filename) if filename else f"attachment-{attachment_id}",
+                        "content_type": part.get_content_type(),
+                        "data": encoded,
+                        "size": len(payload_bytes),
+                    },
+                    "found": True,
+                })
             idx += 1
-    return {}
+    return _tool_result({"attachment": None, "found": False})
 
 
 @mcp.tool()
@@ -741,7 +751,7 @@ def send_message(
     cc: Optional[List[str]] = None,
     bcc: Optional[List[str]] = None,
     attachments: Optional[List[Dict[str, str]]] = None
-) -> str:
+) -> ToolResult:
     """
     Send an email message with optional HTML and attachments.
 
@@ -792,7 +802,8 @@ def send_message(
         except Exception:
             pass
     # Return the message ID for reference
-    return msg.get('Message-ID', '') or ''
+    message_id = msg.get('Message-ID', '') or ''
+    return _tool_result({"messageId": message_id})
 
 
 @mcp.tool()
@@ -804,7 +815,7 @@ def create_draft(
     cc: Optional[List[str]] = None,
     bcc: Optional[List[str]] = None,
     attachments: Optional[List[Dict[str, str]]] = None
-) -> str:
+) -> ToolResult:
     """
     Create a draft message in the user's Drafts mailbox.
 
@@ -847,7 +858,8 @@ def create_draft(
             imap.logout()
         except Exception:
             pass
-    return msg.get('Message-ID', '') or ''
+    message_id = msg.get('Message-ID', '') or ''
+    return _tool_result({"messageId": message_id})
 
 def _move_message_impl(mailbox: str, uid: str, dest_mailbox: str) -> bool:
     imap = _open_imap()
@@ -880,7 +892,7 @@ def move_message(
     mailbox: str,
     uid: str,
     dest_mailbox: str
-) -> bool:
+) -> ToolResult:
     """
     Move a message from one mailbox to another.
 
@@ -891,14 +903,15 @@ def move_message(
 
     Returns: True if the message was successfully moved, False otherwise.
     """
-    return _move_message_impl(mailbox, uid, dest_mailbox)
+    success = _move_message_impl(mailbox, uid, dest_mailbox)
+    return _tool_result({"success": success})
 
 
 @mcp.tool()
 def delete_message(
     mailbox: str,
     uid: str
-) -> bool:
+) -> ToolResult:
     """
     Delete a message from a mailbox.  Deletion is permanent and
     cannot be undone unless the server retains a trash folder.  If
@@ -910,10 +923,10 @@ def delete_message(
     try:
         status, _ = imap.select(mailbox)
         if status != 'OK':
-            return False
+            return _tool_result({"success": False})
         imap.uid('STORE', uid, '+FLAGS', '(\\Deleted)')
         imap.expunge()
-        return True
+        return _tool_result({"success": True})
     finally:
         try:
             imap.close()
@@ -929,14 +942,15 @@ def delete_message(
 def archive_message(
     mailbox: str,
     uid: str
-) -> bool:
+) -> ToolResult:
     """
     Archive a message by moving it into the configured archive mailbox.
 
     This simply calls `move_message` with the destination set to
     ``ARCHIVE_MAILBOX``.  Returns True on success.
     """
-    return _move_message_impl(mailbox, uid, ARCHIVE_MAILBOX)
+    success = _move_message_impl(mailbox, uid, ARCHIVE_MAILBOX)
+    return _tool_result({"success": success})
 
 
 @mcp.tool()
@@ -945,7 +959,7 @@ def flag_message(
     uid: str,
     flag: str,
     value: bool
-) -> bool:
+) -> ToolResult:
     """
     Add or remove a flag from a message.
 
@@ -966,10 +980,10 @@ def flag_message(
     try:
         status, _ = imap.select(mailbox)
         if status != 'OK':
-            return False
+            return _tool_result({"success": False})
         op = '+FLAGS' if value else '-FLAGS'
         status, _ = imap.uid('STORE', uid, op, f'({flag})')
-        return status == 'OK'
+        return _tool_result({"success": status == 'OK'})
     finally:
         try:
             imap.close()
@@ -1074,7 +1088,7 @@ def _caldav_to_iso(value: Any) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_calendars() -> List[Dict[str, Any]]:
+def list_calendars() -> ToolResult:
     """
     List all calendars available to the authenticated iCloud account.
 
@@ -1092,7 +1106,7 @@ def list_calendars() -> List[Dict[str, Any]]:
             "url": str(cal.url),
             "id": getattr(cal, 'id', None),
         })
-    return out
+    return _tool_result({"calendars": out}, text=f"{len(out)} calendar(s)")
 
 
 @mcp.tool()
@@ -1101,7 +1115,7 @@ def list_events(
     start: str,
     end: str,
     expand_recurring: bool = True
-) -> List[Dict[str, Any]]:
+) -> ToolResult:
     """
     List calendar events occurring between two datetimes.  Recurring
     events can be expanded into individual instances by setting
@@ -1120,14 +1134,14 @@ def list_events(
     """
     cal = _caldav_resolve_calendar(calendar_name_or_url)
     if cal is None:
-        return []
+        return _tool_result({"events": []}, text="0 event(s)")
     s = _caldav_parse_iso(start)
     e = _caldav_parse_iso(end)
     try:
         events = cal.search(event=True, start=s, end=e, expand=expand_recurring)
     except Exception as exc:
         log.error("CalDAV list_events error: %s", exc)
-        return []
+        return _tool_result({"events": []}, text="0 event(s)")
     out: List[Dict[str, Any]] = []
     for ev in events:
         comp = ev.component
@@ -1142,7 +1156,7 @@ def list_events(
             "end": _caldav_to_iso(dtend),
             "raw": ev.data,
         })
-    return out
+    return _tool_result({"events": out}, text=f"{len(out)} event(s)")
 
 
 @mcp.tool()
@@ -1153,7 +1167,7 @@ def create_event(
     end: str,
     tzid: Optional[str] = None,
     description: Optional[str] = None
-) -> str:
+) -> ToolResult:
     """
     Create a new calendar event.
 
@@ -1170,7 +1184,7 @@ def create_event(
     """
     cal = _caldav_resolve_calendar(calendar_name_or_url)
     if cal is None:
-        return ""
+        return _tool_result({"uid": "", "created": False})
     s = _caldav_parse_iso(start)
     e = _caldav_parse_iso(end)
     tzid = tzid or DEFAULT_TZID
@@ -1195,8 +1209,8 @@ def create_event(
         cal.save_event(ics_data)
     except Exception as exc:
         log.error("CalDAV create_event error: %s", exc)
-        return ""
-    return uid
+        return _tool_result({"uid": "", "created": False})
+    return _tool_result({"uid": uid, "created": True})
 
 
 @mcp.tool()
@@ -1208,7 +1222,7 @@ def update_event(
     end: Optional[str] = None,
     tzid: Optional[str] = None,
     description: Optional[str] = None
-) -> bool:
+) -> ToolResult:
     """
     Update an existing event identified by its UID.
 
@@ -1218,7 +1232,7 @@ def update_event(
     """
     cal = _caldav_resolve_calendar(calendar_name_or_url)
     if cal is None:
-        return False
+        return _tool_result({"success": False, "reason": "calendar-not-found"})
     now = dt.datetime.now(dt.timezone.utc)
     # search window of ±3 years
     s_window = now - dt.timedelta(days=365 * 3)
@@ -1232,9 +1246,9 @@ def update_event(
                 break
     except Exception as exc:
         log.error("CalDAV update_event search error: %s", exc)
-        return False
+        return _tool_result({"success": False, "reason": "search-failed"})
     if target is None:
-        return False
+        return _tool_result({"success": False, "reason": "event-not-found"})
     comp = target.component
     old_summary = str(comp.get('summary', '')) if comp.get('summary') is not None else ''
     old_desc = str(comp.get('description', '')) if comp.get('description') is not None else ''
@@ -1273,17 +1287,17 @@ def update_event(
     try:
         target.data = new_ics
         target.save()
-        return True
+        return _tool_result({"success": True})
     except Exception as exc:
         log.error("CalDAV update_event error: %s", exc)
-        return False
+        return _tool_result({"success": False, "reason": "update-failed"})
 
 
 @mcp.tool()
 def delete_event(
     calendar_name_or_url: str,
     uid: str
-) -> bool:
+) -> ToolResult:
     """
     Delete an event from the specified calendar by UID.
 
@@ -1292,7 +1306,7 @@ def delete_event(
     """
     cal = _caldav_resolve_calendar(calendar_name_or_url)
     if cal is None:
-        return False
+        return _tool_result({"success": False, "reason": "calendar-not-found"})
     now = dt.datetime.now(dt.timezone.utc)
     s_window = now - dt.timedelta(days=365 * 3)
     e_window = now + dt.timedelta(days=365 * 3)
@@ -1301,11 +1315,11 @@ def delete_event(
             comp = ev.component
             if str(comp.get('uid', '')) == uid:
                 ev.delete()
-                return True
+                return _tool_result({"success": True})
     except Exception as exc:
         log.error("CalDAV delete_event error: %s", exc)
-        return False
-    return False
+        return _tool_result({"success": False, "reason": "delete-failed"})
+    return _tool_result({"success": False, "reason": "event-not-found"})
 
 
 def _event_instance_key(component: Any) -> str:
@@ -1348,7 +1362,7 @@ def search_events(
     scan_days: Optional[int] = None,
     max_results: Optional[int] = None,
     chunk_days: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+) -> ToolResult:
     """
     Perform a free-text search across event summaries and descriptions
     around the current date.  Results default to a ±365 day window, but
@@ -1363,10 +1377,10 @@ def search_events(
     * ``snippet`` - ISO start time and calendar name.
     """
     if DAVClient is None:
-        return []
+        return _tool_result({"results": []}, text="0 result(s)")
     q = (query or '').strip().lower()
     if not q:
-        return []
+        return _tool_result({"results": []}, text="0 result(s)")
 
     scan_days_val = max(1, scan_days if scan_days is not None else SEARCH_SCAN_DAYS_DEFAULT)
     chunk_days_val = max(1, chunk_days if chunk_days is not None else SEARCH_CHUNK_DAYS_DEFAULT)
@@ -1416,13 +1430,13 @@ def search_events(
                     'title': summary[:200],
                     'snippet': f"{when} — {calname}",
                 })
-    return rows
+    return _tool_result({"results": rows}, text=f"{len(rows)} result(s)")
 
 
 @mcp.tool()
 def fetch_events(
     ids: List[str]
-) -> List[Dict[str, Any]]:
+) -> ToolResult:
     """
     Fetch raw iCalendar (ICS) data for a list of composite event IDs.
     The input IDs should be of the form ``"{calendar_url}|{uid}"`` as
@@ -1432,7 +1446,7 @@ def fetch_events(
     (always ``"text/calendar"``) and ``content`` (the raw event data).
     """
     if DAVClient is None:
-        return []
+        return _tool_result({"events": []}, text="0 event(s)")
     ids = ids or []
     calendars = {str(c.url): c for c in _caldav_all_calendars()}
     # Use same scan window as search_events
@@ -1464,7 +1478,7 @@ def fetch_events(
                 'mimeType': 'text/calendar',
                 'content': found_raw,
             })
-    return out
+    return _tool_result({"events": out}, text=f"{len(out)} event(s)")
 
 
 # ---------------------------------------------------------------------------
