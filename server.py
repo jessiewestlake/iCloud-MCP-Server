@@ -81,7 +81,7 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -97,6 +97,15 @@ try:
     from caldav.davclient import DAVClient  # type: ignore
 except Exception:
     DAVClient = None  # type: ignore
+
+try:  # Optional but strongly recommended for calendar manipulation helpers
+    from icalendar import Alarm as ICalendarAlarm  # type: ignore
+    from icalendar import Calendar as ICalendarCalendar  # type: ignore
+    from icalendar import Event as ICalendarEvent  # type: ignore
+except Exception:  # pragma: no cover - exercised when dependency is missing
+    ICalendarAlarm = None  # type: ignore
+    ICalendarCalendar = None  # type: ignore
+    ICalendarEvent = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +326,193 @@ def _tool_result(payload: Dict[str, Any], *, text: Optional[str] = None) -> Tool
     return ToolResult(content=blocks, structured_content=payload)
 
 
+ReminderSpec = Dict[str, Any]
+NormalizedReminderSpec = Dict[str, Any]
+
+
+def _format_duration_for_ics(delta: dt.timedelta) -> str:
+    """Convert a timedelta into an ICS duration string (e.g. -PT15M)."""
+    total_seconds = int(delta.total_seconds())
+    sign = '-' if total_seconds < 0 else ''
+    total_seconds = abs(total_seconds)
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts: List[str] = []
+    if days:
+        parts.append(f"{days}D")
+    time_parts: List[str] = []
+    if hours:
+        time_parts.append(f"{hours}H")
+    if minutes:
+        time_parts.append(f"{minutes}M")
+    if seconds or (not time_parts and not parts):
+        time_parts.append(f"{seconds}S")
+    if time_parts:
+        parts.append('T' + ''.join(time_parts))
+    if not parts:
+        parts.append('T0S')
+    return f"{sign}P{''.join(parts)}"
+
+
+def _normalize_reminder_spec(reminder: ReminderSpec) -> Optional[NormalizedReminderSpec]:
+    """Validate and normalise reminder specifications provided by clients."""
+    if not isinstance(reminder, dict):
+        return None
+    action = str(reminder.get('action', 'DISPLAY') or 'DISPLAY').strip().upper()
+    if action not in {'DISPLAY', 'EMAIL'}:
+        action = 'DISPLAY'
+    description = str(reminder.get('description') or 'Reminder')
+
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    trigger_raw = reminder.get('trigger')
+    absolute_raw = reminder.get('absolute') or reminder.get('at')
+    minutes_before_start = reminder.get('minutes_before_start')
+    minutes_before_end = reminder.get('minutes_before_end')
+    seconds_before_start = reminder.get('seconds_before_start')
+    seconds_before_end = reminder.get('seconds_before_end')
+    related = str(reminder.get('related', 'start')).lower()
+    if related not in {'start', 'end'}:
+        related = 'start'
+
+    trigger: Union[dt.timedelta, dt.datetime, str]
+
+    if absolute_raw:
+        try:
+            trigger = _caldav_parse_iso(str(absolute_raw))
+        except Exception:
+            return None
+        related = str(reminder.get('related', 'start')).lower()
+        if related not in {'start', 'end'}:
+            related = 'start'
+    elif trigger_raw:
+        trigger = str(trigger_raw)
+    else:
+        if minutes_before_start is not None:
+            minutes_value = _to_float(minutes_before_start)
+            if minutes_value is None:
+                return None
+            trigger = -dt.timedelta(minutes=abs(minutes_value))
+            related = 'start'
+        elif minutes_before_end is not None:
+            minutes_value = _to_float(minutes_before_end)
+            if minutes_value is None:
+                return None
+            trigger = -dt.timedelta(minutes=abs(minutes_value))
+            related = 'end'
+        elif seconds_before_start is not None:
+            seconds_value = _to_float(seconds_before_start)
+            if seconds_value is None:
+                return None
+            trigger = -dt.timedelta(seconds=abs(seconds_value))
+            related = 'start'
+        elif seconds_before_end is not None:
+            seconds_value = _to_float(seconds_before_end)
+            if seconds_value is None:
+                return None
+            trigger = -dt.timedelta(seconds=abs(seconds_value))
+            related = 'end'
+        else:
+            trigger = -dt.timedelta(minutes=15)
+            related = 'start'
+
+    normalised: NormalizedReminderSpec = {
+        'action': action,
+        'description': description,
+        'trigger': trigger,
+        'related': related,
+    }
+
+    repeat_val = reminder.get('repeat')
+    try:
+        repeat_int = int(repeat_val) if repeat_val is not None else None
+    except (TypeError, ValueError):
+        repeat_int = None
+    if repeat_int and repeat_int > 0:
+        normalised['repeat'] = repeat_int
+        duration_val = reminder.get('duration')
+        if isinstance(duration_val, dt.timedelta):
+            normalised['duration'] = duration_val
+        elif isinstance(duration_val, (int, float)):
+            normalised['duration'] = dt.timedelta(minutes=float(duration_val))
+        elif isinstance(duration_val, str):
+            normalised['duration'] = duration_val
+
+    return normalised
+
+
+def _reminder_spec_to_alarm(spec: NormalizedReminderSpec):
+    """Convert a normalised spec into an icalendar Alarm component if possible."""
+    if ICalendarAlarm is None:
+        return None
+    alarm = ICalendarAlarm()
+    alarm.add('action', spec['action'])
+    alarm.add('description', spec['description'])
+    trigger = spec['trigger']
+    if isinstance(trigger, dt.timedelta):
+        alarm.add('trigger', trigger)
+    elif isinstance(trigger, dt.datetime):
+        alarm.add('trigger', trigger)
+        alarm['TRIGGER'].params['VALUE'] = 'DATE-TIME'
+    else:
+        alarm.add('trigger', trigger)
+    if spec.get('related') == 'end':
+        alarm['TRIGGER'].params['RELATED'] = 'END'
+    repeat_val = spec.get('repeat')
+    if isinstance(repeat_val, int) and repeat_val > 0:
+        alarm.add('repeat', repeat_val)
+        duration_val = spec.get('duration')
+        if isinstance(duration_val, dt.timedelta):
+            alarm.add('duration', duration_val)
+        elif isinstance(duration_val, (int, float)):
+            alarm.add('duration', dt.timedelta(minutes=float(duration_val)))
+        elif isinstance(duration_val, str):
+            alarm.add('duration', duration_val)
+    return alarm
+
+
+def _reminder_spec_to_ics_lines(spec: NormalizedReminderSpec) -> List[str]:
+    """Render a normalised reminder specification into raw ICS VALARM lines."""
+    trigger = spec['trigger']
+    trigger_params: List[str] = []
+    if isinstance(trigger, dt.timedelta):
+        trigger_value = _format_duration_for_ics(trigger)
+    elif isinstance(trigger, dt.datetime):
+        trigger_params.append('VALUE=DATE-TIME')
+        trigger_value = trigger.astimezone(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    else:
+        trigger_value = str(trigger)
+    if spec.get('related') == 'end':
+        trigger_params.append('RELATED=END')
+    param_segment = ''
+    if trigger_params:
+        param_segment = ';' + ';'.join(trigger_params)
+    lines = [
+        'BEGIN:VALARM',
+        f"ACTION:{spec['action']}",
+        f"DESCRIPTION:{_ics_escape(spec['description'])}",
+        f"TRIGGER{param_segment}:{trigger_value}",
+    ]
+    repeat_val = spec.get('repeat')
+    if isinstance(repeat_val, int) and repeat_val > 0:
+        lines.append(f"REPEAT:{repeat_val}")
+        duration_val = spec.get('duration')
+        if isinstance(duration_val, dt.timedelta):
+            lines.append(f"DURATION:{_format_duration_for_ics(duration_val)}")
+        elif isinstance(duration_val, (int, float)):
+            lines.append(f"DURATION:{_format_duration_for_ics(dt.timedelta(minutes=float(duration_val)))}")
+        elif isinstance(duration_val, str):
+            lines.append(f"DURATION:{duration_val}")
+    lines.append('END:VALARM')
+    return lines
+
+
+
 # ---------------------------------------------------------------------------
 #  Mail Tools
 #
@@ -344,6 +540,8 @@ def list_mailboxes() -> ToolResult:
         mailboxes: List[Dict[str, Any]] = []
         if status == 'OK' and data:
             for line in data:
+                if not isinstance(line, bytes):
+                    continue
                 entry = _parse_imap_list_line(line)
                 if entry:
                     mailboxes.append(entry)
@@ -388,7 +586,7 @@ def list_messages(
         status, _ = imap.select(mailbox, readonly=True)
         if status != 'OK':
             return _tool_result({"messages": []}, text="0 message(s)")
-        status, data = imap.uid('SEARCH', None, 'ALL')
+        status, data = imap.uid('SEARCH', None, 'ALL')  # type: ignore[arg-type]
         if status != 'OK' or not data or not data[0]:
             return _tool_result({"messages": []}, text="0 message(s)")
         # data[0] is a space-delimited bytes string of UIDs
@@ -487,7 +685,7 @@ def search_messages(
         # IMAP SEARCH expects the search terms as separate arguments.  We
         # wrap the query in quotes so that spaces are included in the
         # search term.
-        status, data = imap.uid('SEARCH', None, 'TEXT', f'"{query}"')
+        status, data = imap.uid('SEARCH', None, 'TEXT', f'"{query}"')  # type: ignore[arg-type]
         if status != 'OK' or not data or not data[0]:
             return _tool_result({"uids": []}, text="0 matches")
         uids = [uid.decode() if isinstance(uid, bytes) else str(uid) for uid in data[0].split()]
@@ -1169,7 +1367,10 @@ def create_event(
     start: str,
     end: str,
     tzid: Optional[str] = None,
-    description: Optional[str] = None
+    description: Optional[str] = None,
+    location: Optional[str] = None,
+    url: Optional[str] = None,
+    reminders: Optional[List[ReminderSpec]] = None,
 ) -> ToolResult:
     """
     Create a new calendar event.
@@ -1181,6 +1382,14 @@ def create_event(
         end: ISO datetime when the event ends.
         tzid: Optional IANA timezone identifier (e.g. ``"America/New_York"``).
         description: Optional event description text.
+        location: Optional location string for the event.
+        url: Optional URL associated with the event (e.g. meeting link).
+        reminders: Optional list of reminder dictionaries. Each reminder can
+            contain ``minutes_before_start`` or ``minutes_before_end`` to
+            define relative triggers, an optional ``description`` and
+            optional ``action`` (defaults to ``DISPLAY``). Supplying
+            ``repeat`` and ``duration`` is also supported for repeating
+            reminders.
 
     Returns: The UID assigned to the created event.
     If CalDAV support is unavailable, an empty string is returned.
@@ -1191,23 +1400,59 @@ def create_event(
     s = _caldav_parse_iso(start)
     e = _caldav_parse_iso(end)
     tzid = tzid or DEFAULT_TZID
+    raw_reminders = [_normalize_reminder_spec(r) for r in (reminders or [])]
+    normalised_reminders = [spec for spec in raw_reminders if spec]
     # Generate a random UID using os.urandom.  Append a domain to
     # satisfy iCalendar requirements.
     uid = os.urandom(16).hex() + "@chatgpt-mcp"
-    ics_lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//ChatGPT MCP iCloud//EN",
-        "BEGIN:VEVENT",
-        f"UID:{uid}",
-        f"SUMMARY:{_ics_escape(summary)}",
-        f"DTSTART;TZID={tzid}:{_caldav_fmt(s)}",
-        f"DTEND;TZID={tzid}:{_caldav_fmt(e)}",
-    ]
-    if description:
-        ics_lines.append(f"DESCRIPTION:{_ics_escape(description)}")
-    ics_lines += ["END:VEVENT", "END:VCALENDAR"]
-    ics_data = "\n".join(ics_lines)
+    if ICalendarCalendar and ICalendarEvent:
+        cal_component = ICalendarCalendar()
+        cal_component.add('prodid', '-//ChatGPT MCP iCloud//EN')
+        cal_component.add('version', '2.0')
+        event_component = ICalendarEvent()
+        event_component.add('uid', uid)
+        event_component.add('summary', summary)
+        event_component.add('dtstart', s)
+        event_component.add('dtend', e)
+        if tzid:
+            try:
+                event_component['DTSTART'].params['TZID'] = tzid
+                event_component['DTEND'].params['TZID'] = tzid
+            except Exception:
+                pass
+        if description:
+            event_component.add('description', description)
+        if location:
+            event_component.add('location', location)
+        if url:
+            event_component.add('url', url)
+        for spec in normalised_reminders:
+            alarm_component = _reminder_spec_to_alarm(spec)
+            if alarm_component is not None:
+                event_component.add_component(alarm_component)
+        cal_component.add_component(event_component)
+        ics_data = cal_component.to_ical().decode()
+    else:
+        ics_lines = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//ChatGPT MCP iCloud//EN",
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"SUMMARY:{_ics_escape(summary)}",
+            f"DTSTART;TZID={tzid}:{_caldav_fmt(s)}",
+            f"DTEND;TZID={tzid}:{_caldav_fmt(e)}",
+        ]
+        if description:
+            ics_lines.append(f"DESCRIPTION:{_ics_escape(description)}")
+        if location:
+            ics_lines.append(f"LOCATION:{_ics_escape(location)}")
+        if url:
+            ics_lines.append(f"URL:{_ics_escape(url)}")
+        for spec in normalised_reminders:
+            ics_lines.extend(_reminder_spec_to_ics_lines(spec))
+        ics_lines += ["END:VEVENT", "END:VCALENDAR"]
+        ics_data = "\n".join(ics_lines)
     try:
         cal.save_event(ics_data)
     except Exception as exc:
@@ -1224,15 +1469,24 @@ def update_event(
     start: Optional[str] = None,
     end: Optional[str] = None,
     tzid: Optional[str] = None,
-    description: Optional[str] = None
+    description: Optional[str] = None,
+    location: Optional[str] = None,
+    url: Optional[str] = None,
+    reminders: Optional[List[ReminderSpec]] = None,
 ) -> ToolResult:
     """
     Update an existing event identified by its UID.
 
     Only the fields provided are changed; other fields remain as in
-    the original event.  If an event with the given UID cannot be
-    found within ±3 years of the current date, False is returned.
+    the original event.  To remove an existing text field, pass an
+    empty string (``""``).  For reminders, supplying ``None`` keeps the
+    existing alarms, while an empty list removes all reminders.  If an
+    event with the given UID cannot be found within ±3 years of the
+    current date, False is returned.
     """
+    if ICalendarCalendar is None:
+        log.error("icalendar package not available; update_event cannot modify events safely")
+        return _tool_result({"success": False, "reason": "icalendar-missing"})
     cal = _caldav_resolve_calendar(calendar_name_or_url)
     if cal is None:
         return _tool_result({"success": False, "reason": "calendar-not-found"})
@@ -1252,43 +1506,93 @@ def update_event(
         return _tool_result({"success": False, "reason": "search-failed"})
     if target is None:
         return _tool_result({"success": False, "reason": "event-not-found"})
-    comp = target.component
-    old_summary = str(comp.get('summary', '')) if comp.get('summary') is not None else ''
-    old_desc = str(comp.get('description', '')) if comp.get('description') is not None else ''
-    old_dtstart = comp.decoded('dtstart')
-    old_dtend = comp.decoded('dtend', default=None)
-    # Helpers to choose new or fallback values
-    def _to_dt(sval: Optional[str], fallback: dt.datetime) -> dt.datetime:
-        if sval is None:
-            return fallback
-        if sval.endswith('Z'):
-            return dt.datetime.fromisoformat(sval[:-1]).replace(tzinfo=dt.timezone.utc)
-        return dt.datetime.fromisoformat(sval)
-    new_summary = summary if summary is not None else old_summary
-    new_desc = description if description is not None else old_desc
-    new_start = _to_dt(start, old_dtstart)
-    new_end = _to_dt(end, old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1)))
-    # Preserve original TZID if present
     try:
-        orig_tzid = comp['dtstart'].params.get('TZID') if 'dtstart' in comp and hasattr(comp['dtstart'], 'params') else None
-    except Exception:
-        orig_tzid = None
-    use_tzid = tzid or orig_tzid or DEFAULT_TZID
-    new_ics = "\n".join([
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//ChatGPT MCP iCloud//EN",
-        "BEGIN:VEVENT",
-        f"UID:{uid}",
-        f"SUMMARY:{_ics_escape(new_summary)}",
-        f"DTSTART;TZID={use_tzid}:{_caldav_fmt(new_start)}",
-        f"DTEND;TZID={use_tzid}:{_caldav_fmt(new_end)}",
-        *( [f"DESCRIPTION:{_ics_escape(new_desc)}"] if new_desc else [] ),
-        "END:VEVENT",
-        "END:VCALENDAR",
-    ])
+        calendar_component = ICalendarCalendar.from_ical(target.data)
+    except Exception as exc:
+        log.error("CalDAV update_event parse error: %s", exc)
+        return _tool_result({"success": False, "reason": "parse-failed"})
+
+    event_component = None
+    for component in calendar_component.walk('VEVENT'):
+        if str(component.get('uid', '')).strip() == uid:
+            event_component = component
+            break
+    if event_component is None:
+        return _tool_result({"success": False, "reason": "event-not-found"})
+
+    def _set_text_field(field: str, value: Optional[str]) -> None:
+        if value is None:
+            return
+        if value == "":
+            event_component.pop(field, None)
+        else:
+            event_component[field] = value
+
+    _set_text_field('SUMMARY', summary)
+    _set_text_field('DESCRIPTION', description)
+    _set_text_field('LOCATION', location)
+    _set_text_field('URL', url)
+
+    def _set_datetime_field(field: str, candidate: Optional[str]) -> None:
+        if candidate is None:
+            return
+        previous_tzid: Optional[str] = None
+        if field in event_component:
+            try:
+                previous_tzid = event_component[field].params.get('TZID')
+            except Exception:
+                previous_tzid = None
+        dt_value = _caldav_parse_iso(candidate)
+        event_component[field] = dt_value
+        if tzid is not None:
+            try:
+                if tzid:
+                    event_component[field].params['TZID'] = tzid
+                else:
+                    event_component[field].params.pop('TZID', None)
+            except Exception:
+                pass
+        elif previous_tzid:
+            try:
+                event_component[field].params['TZID'] = previous_tzid
+            except Exception:
+                pass
+
+    _set_datetime_field('DTSTART', start)
+    _set_datetime_field('DTEND', end)
+
+    if tzid is not None and start is None and 'DTSTART' in event_component:
+        try:
+            if tzid:
+                event_component['DTSTART'].params['TZID'] = tzid
+            else:
+                event_component['DTSTART'].params.pop('TZID', None)
+        except Exception:
+            pass
+    if tzid is not None and end is None and 'DTEND' in event_component:
+        try:
+            if tzid:
+                event_component['DTEND'].params['TZID'] = tzid
+            else:
+                event_component['DTEND'].params.pop('TZID', None)
+        except Exception:
+            pass
+
+    if reminders is not None:
+        raw_reminders = [_normalize_reminder_spec(r) for r in reminders]
+        normalised_reminders = [spec for spec in raw_reminders if spec]
+        if not hasattr(event_component, 'subcomponents'):
+            event_component.subcomponents = []  # type: ignore[attr-defined]
+        event_component.subcomponents = [
+            comp for comp in getattr(event_component, 'subcomponents', []) if getattr(comp, 'name', '').upper() != 'VALARM'
+        ]
+        for spec in normalised_reminders:
+            alarm_component = _reminder_spec_to_alarm(spec)
+            if alarm_component is not None:
+                event_component.add_component(alarm_component)
+
     try:
-        target.data = new_ics
+        target.data = calendar_component.to_ical().decode()
         target.save()
         return _tool_result({"success": True})
     except Exception as exc:
@@ -1452,11 +1756,6 @@ def fetch_events(
         return _tool_result({"events": []}, text="0 event(s)")
     ids = ids or []
     calendars = {str(c.url): c for c in _caldav_all_calendars()}
-    # Use same scan window as search_events
-    scan_days = int(os.environ.get('SCAN_DAYS', str(3 * 365)))
-    now = dt.datetime.now(dt.timezone.utc)
-    start = now - dt.timedelta(days=scan_days)
-    end = now + dt.timedelta(days=scan_days)
     out: List[Dict[str, Any]] = []
     for ident in ids:
         try:
@@ -1464,15 +1763,22 @@ def fetch_events(
         except ValueError:
             continue
         cal = calendars.get(cal_url)
-        if not cal:
+        if cal is None:
+            cal = _caldav_resolve_calendar(cal_url)
+            if cal is not None:
+                calendars[cal_url] = cal
+        if cal is None:
             continue
         found_raw = None
         try:
-            for ev in cal.search(event=True, start=start, end=end, expand=False):
-                comp = ev.component
-                if str(comp.get('uid', '') or '').strip() == uid:
-                    found_raw = ev.data
-                    break
+            event = cal.event_by_uid(uid)
+            found_raw = getattr(event, 'data', None)
+            if not found_raw:
+                try:
+                    event.load()
+                    found_raw = getattr(event, 'data', None)
+                except Exception:
+                    found_raw = None
         except Exception:
             continue
         if found_raw:
