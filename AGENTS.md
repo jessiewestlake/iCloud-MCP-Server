@@ -5,7 +5,7 @@ This document captures the practical steps that keep the helper tools, server, a
 ## Core Tasks (All Environments)
 
 - **Start server**: `python server.py` from the repo root; expect the FastMCP server to listen on `http://127.0.0.1:8800/mcp`.
-- **Verify port in use**: connect via `http://127.0.0.1:8800/` in a browser or run a quick health request with `curl http://127.0.0.1:8800/mcp/health` (Windows users can rely on `Invoke-WebRequest`).
+- **Verify port in use**: connect via `http://127.0.0.1:8800/` in a browser or run a quick health request with `curl http://127.0.0.1:8800/health` (Windows users can rely on `Invoke-WebRequest`).
 - **Diagnostics toolbox** (repo root):
   - `devtools/check_message.py` → fetches the newest message and prints both structured and raw content.
   - `devtools/peek_imap.py` → prompts for a UID and fetches raw IMAP payload slices via the `_peek_imap` tool.
@@ -31,7 +31,7 @@ This document captures the practical steps that keep the helper tools, server, a
 ## Windows Subsystem for Linux (Ubuntu or similar)
 
 - **Activate environment**: `source .venv/bin/activate` if you keep a separate venv inside WSL.
-- **Server start**: `python server.py`. Confirm binding on localhost by curling from WSL: `curl -s http://127.0.0.1:8800/mcp/health`.
+- **Server start**: `python server.py`. Confirm binding on localhost by curling from WSL: `curl -s http://127.0.0.1:8800/health`.
 - **Expose to Windows side**: If you need Windows tools to reach the WSL server, run `netsh interface portproxy add v4tov4 listenport=8800 listenaddress=127.0.0.1 connectport=8800 connectaddress=<WSL_IP>`, or simply start the server in Windows when possible.
 - **Kill process**: `ps -A | grep server.py` followed by `kill <PID>` (or `pkill -f server.py`). If the process ignores `SIGTERM`, escalate to `kill -9`.
 - **Inspect port usage**: `ss -tulpn | grep 8800` shows which PID owns the port.
